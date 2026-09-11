@@ -31,6 +31,13 @@ namespace PlantTemporaryFlag
             harmony.Patch(
                 AccessTools.Method(typeof(FlagSite), "RenameSite", new[] { typeof(Callback) }),
                 prefix: new HarmonyMethod(typeof(Bootstrap), nameof(RenameTemporaryFlag)));
+
+            GameEvents.onLevelWasLoadedGUIReady.Add(OnLevelWasLoadedGUIReady);
+        }
+
+        private void OnLevelWasLoadedGUIReady(GameScenes scene)
+        {
+            CleanupTemporaryFlags();
         }
 
         private void Update()
@@ -99,6 +106,23 @@ namespace PlantTemporaryFlag
                     flag.TakeDown();
                 return;
             }
+        }
+
+        private static void CleanupTemporaryFlags()
+        {
+            var vessels = new List<Vessel>(FlightGlobals.VesselsLoaded);
+            foreach (var vessel in vessels)
+            {
+                if (vessel == null)
+                    continue;
+
+                var flag = vessel.FindPartModuleImplementing<FlagSite>();
+                if (flag != null && string.Equals(GetSiteName(flag), TemporaryName, StringComparison.Ordinal))
+                    flag.TakeDown();
+            }
+
+            TemporaryFlags.Clear();
+            pendingPlants = 0;
         }
 
         private static string GetSiteName(FlagSite flag)
