@@ -17,7 +17,7 @@ namespace PlantTemporaryFlag
         private static readonly Dictionary<Guid, float> TemporaryFlags = new Dictionary<Guid, float>();
         private static FieldInfo siteNameField;
         private static FieldInfo plaqueTextField;
-        private static MethodInfo vesselRenameAcceptMethod;
+        private static FieldInfo vesselNameField;
         private static MethodInfo canPlantFlagMethod;
         private static Harmony harmony;
 
@@ -26,7 +26,7 @@ namespace PlantTemporaryFlag
             DontDestroyOnLoad(gameObject);
             siteNameField = typeof(FlagSite).GetField("siteName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             plaqueTextField = typeof(FlagSite).GetField("newPlaqueText", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            vesselRenameAcceptMethod = typeof(Vessel).GetMethod("onVesselRenameAccept", BindingFlags.Instance | BindingFlags.NonPublic);
+            vesselNameField = typeof(Vessel).GetField("vesselName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             canPlantFlagMethod = typeof(KerbalEVA).GetMethod("CanPlantFlag", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
             harmony = new Harmony(HarmonyId);
@@ -35,6 +35,7 @@ namespace PlantTemporaryFlag
                 prefix: new HarmonyMethod(typeof(Bootstrap), nameof(RenameTemporaryFlag)));
 
             GameEvents.onLevelWasLoadedGUIReady.Add(OnLevelWasLoadedGUIReady);
+            GameEvents.afterFlagPlanted.Add(OnAfterFlagPlanted);
         }
 
         private void OnLevelWasLoadedGUIReady(GameScenes scene)
@@ -76,20 +77,11 @@ namespace PlantTemporaryFlag
 
         private static bool RenameTemporaryFlag(FlagSite __instance, Callback afterDialog)
         {
-            if (__instance == null || !IsPending(__instance.vessel))
+            if (__instance == null || pendingPlants == 0)
                 return true;
 
             SetField(siteNameField, __instance, TemporaryName);
             SetField(plaqueTextField, __instance, string.Empty);
-            if (__instance.vessel != null)
-            {
-                // The FlagSite field above is runtime-only. Rename the vessel through
-                // KSP's own path so the marker is written to the save file as well.
-                vesselRenameAcceptMethod?.Invoke(__instance.vessel, new object[] { TemporaryName, VesselType.Flag });
-                if (__instance.vessel.protoVessel != null)
-                    __instance.vessel.protoVessel.vesselName = TemporaryName;
-                TemporaryFlags[__instance.vessel.id] = Time.unscaledTime + CleanupDelay;
-            }
 
             // Stock calls this callback after the rename dialog closes. Calling it here
             // completes the same stock placement/XP path without showing a dialog.
@@ -98,12 +90,16 @@ namespace PlantTemporaryFlag
             return false;
         }
 
-        private static bool IsPending(Vessel flagVessel)
+        private static void OnAfterFlagPlanted(FlagSite flag)
         {
-            if (flagVessel == null || pendingPlants == 0)
-                return false;
+            if (flag == null || pendingPlants == 0 || flag.vessel == null)
+                return;
+
             pendingPlants--;
-            return true;
+            SetField(vesselNameField, flag.vessel, TemporaryName);
+            if (flag.vessel.protoVessel != null)
+                flag.vessel.protoVessel.vesselName = TemporaryName;
+            TemporaryFlags[flag.vessel.id] = Time.unscaledTime + CleanupDelay;
         }
 
         private static bool RemoveTemporaryFlag(Guid vesselId)
@@ -113,8 +109,7 @@ namespace PlantTemporaryFlag
                 if (vessel == null || vessel.id != vesselId)
                     continue;
 
-                RemoveTemporaryVessel(vessel);
-                return true;
+                return RemoveTemporaryVessel(vessel);
             }
             return false;
         }
@@ -149,22 +144,13 @@ namespace PlantTemporaryFlag
             return string.Equals(name, TemporaryName, StringComparison.Ordinal);
         }
 
-        private static void RemoveTemporaryVessel(Vessel vessel)
+        private static bool RemoveTemporaryVessel(Vessel vessel)
         {
             if (vessel == null || vessel.vesselType != VesselType.Flag)
-                return;
+                return false;
 
-            if (!FlightGlobals.VesselsLoaded.Contains(vessel))
-            {
-                vessel.Die();
-                return;
-            }
-
-            var flag = vessel.FindPartModuleImplementing<FlagSite>();
-            if (flag != null)
-                flag.TakeDown();
-            else
-                vessel.Die();
+            vessel.Die();
+            return true;
         }
 
         private static void SetField(FieldInfo field, object target, object value)
