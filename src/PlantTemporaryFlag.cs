@@ -11,6 +11,7 @@ namespace PlantTemporaryFlag
     {
         internal const string HarmonyId = "maddavo.planttemporaryflag";
         internal const string TemporaryName = "temp";
+        internal const string LegacyTemporaryName = "Flag";
         internal const float CleanupDelay = 60f;
 
         private static int pendingPlants;
@@ -141,7 +142,8 @@ namespace PlantTemporaryFlag
 
         private static bool IsTemporaryName(string name)
         {
-            return string.Equals(name, TemporaryName, StringComparison.Ordinal);
+            return string.Equals(name, TemporaryName, StringComparison.Ordinal)
+                || string.Equals(name, LegacyTemporaryName, StringComparison.Ordinal);
         }
 
         private static bool RemoveTemporaryVessel(Vessel vessel)
