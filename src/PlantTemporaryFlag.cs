@@ -6,158 +6,190 @@ using UnityEngine;
 
 namespace PlantTemporaryFlag
 {
-    [KSPAddon(KSPAddon.Startup.Instantly, true)]
+    [KSPAddon(KSPAddon.Startup.MainMenu, true)]
     public sealed class Bootstrap : MonoBehaviour
     {
         internal const string HarmonyId = "maddavo.planttemporaryflag";
         internal const string TemporaryName = "temp";
         internal const float CleanupDelay = 60f;
 
-        private static int pendingPlants;
-        private static readonly Dictionary<Guid, float> TemporaryFlags = new Dictionary<Guid, float>();
-        private static FieldInfo siteNameField;
-        private static FieldInfo plaqueTextField;
-        private static FieldInfo vesselNameField;
-        private static MethodInfo canPlantFlagMethod;
+        private sealed class TrackedFlag
+        {
+            internal Vessel Vessel;
+            internal uint PersistentId;
+            internal float Deadline;
+            internal bool Placed;
+        }
+
+        // Stock flags can share Guid.Empty. Never key timers by vessel GUID.
+        private static readonly List<TrackedFlag> Flags = new List<TrackedFlag>();
+        private static readonly Dictionary<Part, float> Requests = new Dictionary<Part, float>();
+        private readonly List<Vessel> loadedFlags = new List<Vessel>();
+        private int cleanupFrame = -1;
+        private static bool ready;
         private static Harmony harmony;
+        private static FieldInfo siteNameField;
+        private static MethodInfo canPlantFlagMethod;
 
         private void Awake()
         {
             DontDestroyOnLoad(gameObject);
-            siteNameField = typeof(FlagSite).GetField("siteName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            plaqueTextField = typeof(FlagSite).GetField("newPlaqueText", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            vesselNameField = typeof(Vessel).GetField("vesselName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            canPlantFlagMethod = typeof(KerbalEVA).GetMethod("CanPlantFlag", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-
-            harmony = new Harmony(HarmonyId);
-            harmony.Patch(
-                AccessTools.Method(typeof(FlagSite), "RenameSite", new[] { typeof(Callback) }),
-                prefix: new HarmonyMethod(typeof(Bootstrap), nameof(RenameTemporaryFlag)));
-
-            GameEvents.onLevelWasLoadedGUIReady.Add(OnLevelWasLoadedGUIReady);
-            GameEvents.afterFlagPlanted.Add(OnAfterFlagPlanted);
-        }
-
-        private void OnLevelWasLoadedGUIReady(GameScenes scene)
-        {
-            CleanupTemporaryFlags();
-        }
-
-        private void Update()
-        {
-            if (TemporaryFlags.Count == 0 || Time.unscaledTime < 0f)
-                return;
-
-            var expired = new List<Guid>();
-            foreach (var item in TemporaryFlags)
+            try
             {
-                if (Time.unscaledTime >= item.Value)
-                    expired.Add(item.Key);
+                siteNameField = AccessTools.Field(typeof(FlagSite), "siteName");
+                canPlantFlagMethod = AccessTools.Method(typeof(KerbalEVA), "CanPlantFlag", Type.EmptyTypes);
+                if (siteNameField == null || canPlantFlagMethod == null)
+                    throw new MissingMemberException("Required stock flag members were not found.");
+                harmony = new Harmony(HarmonyId);
+                harmony.Patch(AccessTools.Method(typeof(FlagSite), "CreateFlag",
+                    new[] { typeof(Vector3), typeof(Quaternion), typeof(Part) }),
+                    postfix: new HarmonyMethod(typeof(Bootstrap), nameof(FlagCreated)));
+                harmony.Patch(AccessTools.Method(typeof(FlagSite), "RenameSite", new[] { typeof(Callback) }),
+                    prefix: new HarmonyMethod(typeof(Bootstrap), nameof(RenameTemporaryFlag)));
+                // KSP EventData dereferences delegate.Target: subscribers MUST be instance methods.
+                GameEvents.onGameStateLoad.Add(OnGameStateLoad);
+                GameEvents.onLevelWasLoadedGUIReady.Add(OnSceneReady);
+                ready = true;
+                Log("0.3.0 ready; creation/placement patches and instance event handlers installed.");
             }
-
-            foreach (var vesselId in expired)
+            catch (Exception error)
             {
-                if (RemoveTemporaryFlag(vesselId))
-                    TemporaryFlags.Remove(vesselId);
-                else
-                    TemporaryFlags[vesselId] = Time.unscaledTime + 5f;
+                ready = false;
+                Debug.LogError("[PlantTemporaryFlag] Initialisation failed: " + error);
             }
         }
 
-        internal static void QueuePlant(Vessel vessel)
+        private void OnDestroy()
         {
-            if (vessel != null)
-                pendingPlants++;
+            ready = false;
+            GameEvents.onGameStateLoad.Remove(OnGameStateLoad);
+            GameEvents.onLevelWasLoadedGUIReady.Remove(OnSceneReady);
+            harmony?.UnpatchAll(HarmonyId);
+            Flags.Clear();
+            Requests.Clear();
         }
 
         internal static bool CanPlantFlag(KerbalEVA eva)
         {
-            return eva != null && canPlantFlagMethod != null && (bool)canPlantFlagMethod.Invoke(eva, null);
+            return ready && eva != null && (bool)canPlantFlagMethod.Invoke(eva, null)
+                && !Requests.ContainsKey(eva.part);
+        }
+
+        internal static void Plant(KerbalEVA eva)
+        {
+            if (!CanPlantFlag(eva)) return;
+            Requests[eva.part] = Time.unscaledTime + 30f;
+            Log("Plant requested by " + eva.vessel.vesselName);
+            try { eva.PlantFlag(); }
+            catch { Requests.Remove(eva.part); throw; }
+        }
+
+        // __2 is the source EVA part: concurrent plants cannot consume each other's request.
+        private static void FlagCreated(FlagSite __result, Part __2)
+        {
+            if (__2 == null || !Requests.TryGetValue(__2, out var deadline)) return;
+            Requests.Remove(__2);
+            if (Time.unscaledTime > deadline || __result == null || __result.vessel == null)
+            {
+                Log("Plant request expired or stock creation failed.");
+                return;
+            }
+            SetName(__result);
+            var vessel = __result.vessel;
+            Flags.Add(new TrackedFlag { Vessel = vessel, PersistentId = vessel.persistentId,
+                Deadline = Time.unscaledTime + CleanupDelay });
+            Log("Captured temporary flag " + vessel.persistentId);
+        }
+
+        private static void SetName(FlagSite flag)
+        {
+            siteNameField.SetValue(flag, TemporaryName);
+            flag.vessel.vesselName = TemporaryName;
+            if (flag.vessel.protoVessel != null) flag.vessel.protoVessel.vesselName = TemporaryName;
         }
 
         private static bool RenameTemporaryFlag(FlagSite __instance, Callback afterDialog)
         {
-            if (__instance == null || pendingPlants == 0)
-                return true;
-
-            SetField(siteNameField, __instance, TemporaryName);
-            SetField(plaqueTextField, __instance, string.Empty);
-
-            // Stock calls this callback after the rename dialog closes. Calling it here
-            // completes the same stock placement/XP path without showing a dialog.
-            if (afterDialog != null)
-                afterDialog();
+            if (__instance == null) return true;
+            var tracked = Flags.Find(item => ReferenceEquals(item.Vessel, __instance.vessel));
+            // Only bypass initial placement. Later manual renaming stays stock.
+            if (tracked == null || tracked.Placed || afterDialog == null) return true;
+            SetName(__instance);
+            tracked.Placed = true;
+            tracked.PersistentId = __instance.vessel.persistentId;
+            tracked.Deadline = Time.unscaledTime + CleanupDelay;
+            Log("Placement complete; flag " + tracked.PersistentId + " expires in 60 real seconds.");
+            // Preserve afterFlagPlanted and KerbalEVA's subsequent stock XP path.
+            afterDialog();
             return false;
         }
 
-        private static void OnAfterFlagPlanted(FlagSite flag)
+        private void OnGameStateLoad(ConfigNode node)
         {
-            if (flag == null || pendingPlants == 0 || flag.vessel == null)
-                return;
-
-            pendingPlants--;
-            SetField(vesselNameField, flag.vessel, TemporaryName);
-            if (flag.vessel.protoVessel != null)
-                flag.vessel.protoVessel.vesselName = TemporaryName;
-            TemporaryFlags[flag.vessel.id] = Time.unscaledTime + CleanupDelay;
-        }
-
-        private static bool RemoveTemporaryFlag(Guid vesselId)
-        {
+            Flags.Clear();
+            Requests.Clear();
+            loadedFlags.Clear();
+            // Installed Game.Load fires AFTER FlightState.Load instantiates all vessels.
             foreach (var vessel in FlightGlobals.Vessels)
+                if (vessel != null && vessel.vesselType == VesselType.Flag &&
+                    string.Equals(vessel.vesselName, TemporaryName, StringComparison.Ordinal))
+                    loadedFlags.Add(vessel);
+            cleanupFrame = Time.frameCount + 2;
+            Log("Loaded-game sweep queued for " + loadedFlags.Count + " temp flags.");
+        }
+
+        private void OnSceneReady(GameScenes scene)
+        {
+            if (scene != GameScenes.MAINMENU) return;
+            Flags.Clear();
+            Requests.Clear();
+            loadedFlags.Clear();
+            cleanupFrame = -1;
+        }
+
+        private void Update()
+        {
+            if (!ready) return;
+            if (cleanupFrame >= 0 && Time.frameCount >= cleanupFrame)
             {
-                if (vessel == null || vessel.id != vesselId)
-                    continue;
-
-                return RemoveTemporaryVessel(vessel);
+                for (int i = loadedFlags.Count - 1; i >= 0; --i)
+                    if (RemoveFlag(loadedFlags[i], "loaded-game cleanup")) loadedFlags.RemoveAt(i);
+                cleanupFrame = loadedFlags.Count == 0 ? -1 : Time.frameCount + 60;
             }
-            return false;
-        }
-
-        private static void CleanupTemporaryFlags()
-        {
-            var vessels = new List<Vessel>(FlightGlobals.Vessels);
-            foreach (var vessel in vessels)
+            var expired = new List<Part>();
+            foreach (var request in Requests)
+                if (request.Key == null || Time.unscaledTime >= request.Value) expired.Add(request.Key);
+            foreach (var part in expired) Requests.Remove(part);
+            for (int i = Flags.Count - 1; i >= 0; --i)
             {
-                if (vessel == null || !IsTemporaryName(GetVesselName(vessel)))
-                    continue;
-
-                RemoveTemporaryVessel(vessel);
+                var tracked = Flags[i];
+                if (Time.unscaledTime < tracked.Deadline) continue;
+                var vessel = tracked.Vessel;
+                if (vessel == null && tracked.PersistentId != 0)
+                    vessel = FlightGlobals.Vessels.Find(v => v != null && v.vesselType == VesselType.Flag
+                        && v.persistentId == tracked.PersistentId);
+                if (RemoveFlag(vessel, "60-second expiry")) Flags.RemoveAt(i);
+                else tracked.Deadline = Time.unscaledTime + 5f;
             }
-
-            TemporaryFlags.Clear();
-            pendingPlants = 0;
         }
 
-        private static string GetSiteName(FlagSite flag)
+        private static bool RemoveFlag(Vessel vessel, string reason)
         {
-            return siteNameField == null ? null : siteNameField.GetValue(flag) as string;
-        }
-
-        private static string GetVesselName(Vessel vessel)
-        {
-            return vessel == null ? null : vessel.GetName();
-        }
-
-        private static bool IsTemporaryName(string name)
-        {
-            return string.Equals(name, TemporaryName, StringComparison.Ordinal);
-        }
-
-        private static bool RemoveTemporaryVessel(Vessel vessel)
-        {
-            if (vessel == null || vessel.vesselType != VesselType.Flag)
+            if (vessel == null || vessel.vesselType != VesselType.Flag) return true;
+            try
+            {
+                Log("Removing flag " + vessel.persistentId + " (" + vessel.vesselName + "): " + reason);
+                vessel.Die(); // Stock removal handles loaded and unloaded vessels.
+                return true;
+            }
+            catch (Exception error)
+            {
+                Debug.LogError("[PlantTemporaryFlag] Removal failed; will retry: " + error);
                 return false;
-
-            vessel.Die();
-            return true;
+            }
         }
 
-        private static void SetField(FieldInfo field, object target, object value)
-        {
-            if (field != null)
-                field.SetValue(target, value);
-        }
+        private static void Log(string message) { Debug.Log("[PlantTemporaryFlag] " + message); }
     }
 
     public sealed class TemporaryFlagEVA : PartModule
@@ -165,12 +197,7 @@ namespace PlantTemporaryFlag
         [KSPEvent(guiActive = true, guiName = "Plant Temporary Flag", active = true)]
         public void PlantTemporaryFlag()
         {
-            var eva = part.FindModuleImplementing<KerbalEVA>();
-            if (!Bootstrap.CanPlantFlag(eva))
-                return;
-
-            Bootstrap.QueuePlant(vessel);
-            eva.PlantFlag();
+            Bootstrap.Plant(part.FindModuleImplementing<KerbalEVA>());
         }
     }
 }
